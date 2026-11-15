@@ -1,9 +1,11 @@
 
 from langchain_openai import ChatOpenAI
 import os, re, json, time
+from rank_bm25 import BM25Okapi
 
-# Number of FAISS candidates passed to the LLM re-ranker
+# Number of FAISS (semantic) and BM25 (keyword) candidates passed to the LLM re-ranker
 FETCH_K = 15
+BM25_K = 5
 
 RERANK_PROMPT = """You are the re-ranking step of a retrieval system for AuroraStay Hotels policy documents.
 
@@ -48,9 +50,31 @@ def rerank(query, candidates, k, model_name="gpt-4o-mini"):
     return candidates[:k]
 
 
-# Two-stage retrieval: FAISS similarity search for recall, LLM re-ranking for precision
+# Keyword (BM25) index over the same chunks stored in the vector database, built once and cached
+_BM25_CACHE = {}
+
+def _tokenize(text):
+    return re.findall(r"[a-z0-9$]+", text.lower())
+
+def bm25_search(query, vectorstore, k):
+    key = id(vectorstore)
+    if key not in _BM25_CACHE:
+        chunks = list(vectorstore.docstore._dict.values())
+        _BM25_CACHE[key] = (BM25Okapi([_tokenize(c.page_content) for c in chunks]), chunks)
+    bm25, chunks = _BM25_CACHE[key]
+    scores = bm25.get_scores(_tokenize(query))
+    top = sorted(range(len(chunks)), key=lambda i: -scores[i])[:k]
+    return [chunks[i] for i in top]
+
+
+# Hybrid retrieval with re-ranking:
+#   1) FAISS similarity search (semantic recall)  2) BM25 keyword search (exact terms such as property codes)
+#   3) LLM re-ranking of the merged candidates (precision)
 def retrieve(query: str, k: int = 2, vectorstore=None) -> list[str]:
     candidates = vectorstore.similarity_search(query, k=max(FETCH_K, k))
+    for chunk in bm25_search(query, vectorstore, BM25_K):
+        if all(chunk.page_content != c.page_content for c in candidates):
+            candidates.append(chunk)
     results = rerank(query, candidates, k)
 
     # Return each chunk with its content and metadata
@@ -80,7 +104,7 @@ def generate(query, retrieved_chunks,model) -> str:
     6. Do not include unrelated information from the retrieved policy information.
     7. Answer the user's specific question directly in the first sentence, and make sure every part of a multi-part question is answered.
     8. Keep the answer concise, clear, and easy to understand (typically 2 to 5 sentences). Do not add generic closing advice that is not stated in the policy.
-    9. Do not invent fees, times, room features, amenities, properties, exceptions, or approval rules, and do not soften or strengthen the policy wording (for example, do not add "typically" or "always" unless the policy says so).
+    9. Do not invent fees, times, room features, amenities, properties, exceptions, or approval rules. Keep the policy's qualifiers exactly (for example "may", "generally", "normally", "not automatically", "not necessarily", "depends on the rate plan or confirmation") and never turn them into absolute statements such as "always", "never", or "is responsible".
     10. If the information is insufficient, say:
         "The available policy documents do not contain enough information to answer this question."
         If only part of the question can be answered, answer that part and state which part is not covered. If the retrieved information conflicts, clearly mention the conflict.
