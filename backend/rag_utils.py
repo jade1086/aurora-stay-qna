@@ -1,10 +1,57 @@
 
 from langchain_openai import ChatOpenAI
-import os
+import os, re, json, time
 
-# Retrieve the top-k relevant chunks from the vector store
-def retrieve(query: str, k: int = 2,vectorstore=None) -> list[str]:
-    results = vectorstore.similarity_search(query, k=k)
+# Number of FAISS candidates passed to the LLM re-ranker
+FETCH_K = 15
+
+RERANK_PROMPT = """You are the re-ranking step of a retrieval system for AuroraStay Hotels policy documents.
+
+Question:
+{query}
+
+Candidate passages:
+{passages}
+
+Task: select ONLY the passages that contain information needed to answer some part of the question
+(for example, the exact property row, rate rule, fee, time, or procedure that is asked about).
+Exclude passages that are only loosely related, generic, or about other topics.
+Order the selected passages from most to least relevant and select at most {k}.
+If no passage is relevant, select the single most related passage.
+
+Return only JSON in this format: {{"selected": [passage numbers]}}"""
+
+
+# Re-rank the FAISS candidates with an LLM and keep only the passages needed to answer the query
+def rerank(query, candidates, k, model_name="gpt-4o-mini"):
+    model = ChatOpenAI(
+        model=model_name,
+        temperature=0,
+        max_tokens=100,
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        openai_api_base=os.getenv("OPENAI_API_BASE")
+    )
+    passages = "\n\n".join(f"[{i}]\n{doc.page_content}" for i, doc in enumerate(candidates))
+    prompt = RERANK_PROMPT.format(query=query, passages=passages, k=k)
+
+    for attempt in range(3):
+        try:
+            raw = model.invoke(prompt).content
+            selected = json.loads(re.search(r"\{.*\}", raw, re.S).group(0))["selected"]
+            selected = [int(i) for i in selected if 0 <= int(i) < len(candidates)]
+            selected = list(dict.fromkeys(selected))[:k]
+            return [candidates[i] for i in selected] or candidates[:1]
+        except Exception:
+            time.sleep(5)
+
+    # Fall back to the dense ranking if the re-ranker is unavailable
+    return candidates[:k]
+
+
+# Two-stage retrieval: FAISS similarity search for recall, LLM re-ranking for precision
+def retrieve(query: str, k: int = 2, vectorstore=None) -> list[str]:
+    candidates = vectorstore.similarity_search(query, k=max(FETCH_K, k))
+    results = rerank(query, candidates, k)
 
     # Return each chunk with its content and metadata
     return [
